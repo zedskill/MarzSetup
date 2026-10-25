@@ -6,8 +6,8 @@ set -e
 # === Config ===
 DASH_PORT=3169
 XRAY_PORT=8080
-ADMIN_USER=$(tr -dc 'a-z' </dev/urandom | head -c 10)
-ADMIN_PASS=$(tr -dc 'A-Za-z0-9' </dev/urandom | head -c 20)
+ADMIN_USER=adm$(openssl rand -hex 4)
+ADMIN_PASS=$(openssl rand -hex 12)
 HOST_IP=$(curl -4 -s --max-time 5 ifconfig.me || curl -4 -s --max-time 5 icanhazip.com || hostname -I | awk '{print $1}')
 CRED_FILE="/root/marzban-credentials.txt"
 
@@ -35,6 +35,7 @@ cat > /var/lib/marzban/xray_config.json << 'XEOF'
     "tag": "api",
     "services": ["HandlerService", "LoggerService", "StatsService"]
   },
+  "stats": {},
   "policy": {
     "levels": {"0": {"statsUserUplink": true, "statsUserDownlink": true}},
     "system": {
@@ -58,11 +59,13 @@ cat > /var/lib/marzban/xray_config.json << 'XEOF'
 XEOF
 
 cat > /opt/marzban/.env << ENVEOF
-UVICORN_HOST=0.0.0.0
+UVICORN_HOST=127.0.0.1
 UVICORN_PORT=${XRAY_PORT}
 UVICORN_SSL_CERTFILE=
 UVICORN_SSL_KEYFILE=
 DASHBOARD_PATH=/dashboard/
+SUDO_USERNAME=${ADMIN_USER}
+SUDO_PASSWORD=${ADMIN_PASS}
 MARZBAN_ADMIN_USERNAME=${ADMIN_USER}
 MARZBAN_ADMIN_PASSWORD=${ADMIN_PASS}
 ENVEOF
@@ -81,35 +84,41 @@ services:
       - /opt/marzban:/opt/marzban
 YMLEOF
 
-cd /opt/marzban && docker compose down 2>/dev/null; sleep 2 && docker compose up -d
+cd /opt/marzban
+docker compose down >/dev/null 2>&1 || true
+sleep 2
+docker compose up -d
 
 # Wait for panel
 echo "[3/6] Waiting for panel ..."
-for i in $(seq 1 20); do
+for i in $(seq 1 30); do
     sleep 3
     CODE=$(curl -s --max-time 5 -o /dev/null -w '%{http_code}' "http://127.0.0.1:${XRAY_PORT}/" 2>/dev/null) || CODE=000
     [ "$CODE" = "200" ] || [ "$CODE" = "307" ] || [ "$CODE" = "404" ] && break
 done
 
-# 4. Create admin
+# 4. Create admin (no TTY prompts)
 echo "[4/6] Creating admin ..."
-printf '\n\n' | docker exec -i -e MARZBAN_ADMIN_PASSWORD="$ADMIN_PASS" marzban-marzban-1 marzban-cli admin create -u "$ADMIN_USER" --sudo 2>/dev/null || true
+docker exec -e MARZBAN_ADMIN_PASSWORD="$ADMIN_PASS" marzban-marzban-1 \
+    marzban-cli admin create -u "$ADMIN_USER" --sudo --telegram-id 0 --discord-webhook "" \
+    >/dev/null 2>&1 || true
 sleep 2
 
-# Get token
-TOKEN=$(curl -s -X POST "http://127.0.0.1:${XRAY_PORT}/api/admin/token" \
-    -H 'Content-Type: application/x-www-form-urlencoded' \
-    -d "username=${ADMIN_USER}&password=${ADMIN_PASS}" 2>/dev/null | python3 -c "import sys,json; print(json.load(sys.stdin).get('access_token',''))" 2>/dev/null) || true
+token_req() {
+    curl -s -X POST "http://127.0.0.1:${XRAY_PORT}/api/admin/token" \
+        -H 'Content-Type: application/x-www-form-urlencoded' \
+        -d "username=${ADMIN_USER}&password=${ADMIN_PASS}" \
+        | python3 -c "import sys,json; print(json.load(sys.stdin).get('access_token',''))" 2>/dev/null || true
+}
 
+TOKEN=$(token_req)
 if [ -z "$TOKEN" ]; then
     echo "Retrying token in 5s..."
     sleep 5
-    TOKEN=$(curl -s -X POST "http://127.0.0.1:${XRAY_PORT}/api/admin/token" \
-        -H 'Content-Type: application/x-www-form-urlencoded' \
-        -d "username=${ADMIN_USER}&password=${ADMIN_PASS}" 2>/dev/null | python3 -c "import sys,json; print(json.load(sys.stdin).get('access_token',''))" 2>/dev/null) || true
+    TOKEN=$(token_req)
 fi
 
-[ -z "$TOKEN" ] && { echo "Failed to get admin token."; exit 1; }
+[ -n "$TOKEN" ] || { echo "Failed to get admin token."; exit 1; }
 
 # 5. Nginx
 echo "[5/6] Setting up Nginx ..."
@@ -120,6 +129,7 @@ systemctl start nginx 2>/dev/null || systemctl restart nginx
 cat > /etc/nginx/sites-available/marzban << NGEOF
 server {
     listen ${DASH_PORT} default_server;
+    listen [::]:${DASH_PORT} default_server;
 
     location /statics/ {
         proxy_pass http://127.0.0.1:${XRAY_PORT}/statics/;
@@ -167,17 +177,19 @@ server {
 NGEOF
 
 ln -sf /etc/nginx/sites-available/marzban /etc/nginx/sites-enabled/marzban
+rm -f /etc/nginx/sites-enabled/default
 nginx -t 2>/dev/null && systemctl restart nginx
 
-# 6. Inbounds
+# 6. Inbounds — 4 protocols (API inbound required)
 echo "[6/6] Creating inbounds ..."
-cat > /tmp/xray_cfg.json << INEOF
+cat > /tmp/xray_cfg.json << 'INEOF'
 {
   "log": {"loglevel": "info"},
   "api": {
     "tag": "api",
     "services": ["HandlerService", "LoggerService", "StatsService"]
   },
+  "stats": {},
   "policy": {
     "levels": {"0": {"statsUserUplink": true, "statsUserDownlink": true}},
     "system": {
@@ -190,6 +202,7 @@ cat > /tmp/xray_cfg.json << INEOF
     "rules": [{"inboundTag": ["api"], "outboundTag": "api", "type": "field"}]
   },
   "inbounds": [
+    {"tag": "api", "listen": "127.0.0.1", "port": 62789, "protocol": "dokodemo-door", "settings": {"address": "127.0.0.1"}},
     {"tag": "vless-tcp", "listen": "0.0.0.0", "port": 5000, "protocol": "vless", "settings": {"clients": [], "decryption": "none", "fallbacks": []}, "streamSettings": {"network": "tcp", "security": "none", "tcpSettings": {"header": {"type": "none"}}}},
     {"tag": "vmess-tcp", "listen": "0.0.0.0", "port": 5001, "protocol": "vmess", "settings": {"clients": [], "disableFallback": false, "fallbacks": []}, "streamSettings": {"network": "tcp", "security": "none", "tcpSettings": {"header": {"type": "none"}}}},
     {"tag": "trojan-tcp", "listen": "0.0.0.0", "port": 5002, "protocol": "trojan", "settings": {"clients": [], "fallbacks": []}, "streamSettings": {"network": "tcp", "security": "none", "tcpSettings": {"header": {"type": "none"}}}},
@@ -203,11 +216,13 @@ cat > /tmp/xray_cfg.json << INEOF
 }
 INEOF
 
-curl -s -X PUT "http://127.0.0.1:${XRAY_PORT}/api/core/config" \
+PUT=$(curl -s -o /tmp/xray_put.out -w '%{http_code}' -X PUT "http://127.0.0.1:${XRAY_PORT}/api/core/config" \
     -H 'Content-Type: application/json' \
     -H "Authorization: Bearer ${TOKEN}" \
-    -d @/tmp/xray_cfg.json >/dev/null 2>&1 || true
-rm -f /tmp/xray_cfg.json
+    -d @/tmp/xray_cfg.json)
+echo "core config HTTP $PUT"
+[ "$PUT" = "200" ] || cat /tmp/xray_put.out
+rm -f /tmp/xray_cfg.json /tmp/xray_put.out
 
 # 7. Firewall
 DEBIAN_FRONTEND=noninteractive apt-get install -y -qq iptables-persistent netfilter-persistent >/dev/null 2>&1 || true
@@ -235,7 +250,6 @@ CREOF
 
 chmod 600 "$CRED_FILE"
 
-# Done
 echo ""
 echo "============================="
 echo "Panel: ${PANEL_URL}"
