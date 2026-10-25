@@ -25,7 +25,7 @@ One-shot Marzban panel installer with Nginx reverse proxy, firewall rules and cr
 ### Install
 
 ```bash
-sudo bash -c "$(curl -fsSL https://raw.githubusercontent.com/myrat-stack/MarzSetup/main/install.sh)"
+sudo bash -c "$(curl -fsSL https://raw.githubusercontent.com/zedskill/MarzSetup/main/install.sh)"
 ```
 
 That's it. The script handles everything else.
